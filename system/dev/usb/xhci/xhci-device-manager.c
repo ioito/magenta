@@ -130,7 +130,7 @@ static mx_status_t xhci_address_device(xhci_t* xhci, uint32_t slot_id, uint32_t 
     XHCI_SET_BITS32(&sc->sc2, SLOT_CTX_TT_PORT_NUM_START, SLOT_CTX_TT_PORT_NUM_BITS, tt_port_number);
 
     // Setup endpoint context for ep0
-    mx_paddr_t tr_dequeue = xhci_transfer_ring_start_phys(transfer_ring);
+    mx_paddr_t tr_dequeue = xhci_transfer_ring_current_phys(transfer_ring);
 
     XHCI_SET_BITS32(&ep0c->epc1, EP_CTX_CERR_START, EP_CTX_CERR_BITS, 3); // ???
     XHCI_SET_BITS32(&ep0c->epc1, EP_CTX_EP_TYPE_START, EP_CTX_EP_TYPE_BITS, EP_CTX_EP_TYPE_CONTROL);
@@ -141,7 +141,68 @@ static mx_status_t xhci_address_device(xhci_t* xhci, uint32_t slot_id, uint32_t 
 
     // install our device context for the slot
     XHCI_WRITE64(&xhci->dcbaa[slot_id], io_buffer_phys(&slot->buffer));
-    // then send the address device command
+
+
+    status = xhci_send_command(xhci, TRB_CMD_ADDRESS_DEVICE, icc_phys,
+                                   (slot_id << TRB_SLOT_ID_START) | TRB_BSR);
+
+    if (status != MX_OK) {
+        printf("TRB_CMD_ADDRESS_DEVICE failed\n");
+        mtx_unlock(&xhci->input_context_lock);
+        return status;
+    }
+
+    // need to set this before reading the device descriptor
+    ep->enabled = true;
+
+    // read first 8 bytes of device descriptor to fetch ep0 max packet size
+    usb_device_descriptor_t device_descriptor;
+    for (int i = 0; i < 5; i++) {
+        status = xhci_get_descriptor(xhci, slot_id, USB_TYPE_STANDARD, USB_DT_DEVICE << 8, 0,
+                                     &device_descriptor, 8);
+        if (status == MX_ERR_IO_REFUSED) {
+            printf("xhci_handle_enumerate_device xhci_reset_endpoint\n");
+            xhci_reset_endpoint(xhci, slot_id, 0);
+        } else {
+            break;
+        }
+    }
+    if (status != 8) {
+        printf("xhci_get_descriptor failed: %d\n", status);
+        ep->enabled = false;
+        mtx_unlock(&xhci->input_context_lock);
+        return status;
+    }
+
+    int mps = device_descriptor.bMaxPacketSize0;
+    // enforce correct max packet size for ep0
+    switch (speed) {
+        case USB_SPEED_LOW:
+            mps = 8;
+            break;
+        case USB_SPEED_FULL:
+            if (mps != 8 && mps != 16 && mps != 32 && mps != 64) {
+                mps = 8;
+            }
+            break;
+        case USB_SPEED_HIGH:
+            mps = 64;
+            break;
+        case USB_SPEED_SUPER:
+            // bMaxPacketSize0 is an exponent for superspeed devices
+            mps = 1 << mps;
+            break;
+        default:
+            break;
+    }
+
+    // update max packet size
+    XHCI_SET_BITS32(&ep0c->epc1, EP_CTX_MAX_PACKET_SIZE_START, EP_CTX_MAX_PACKET_SIZE_BITS, mps);
+
+    // update dequeue ptr
+    tr_dequeue = xhci_transfer_ring_current_phys(transfer_ring);
+    XHCI_WRITE32(&ep0c->epc2, ((uint32_t)tr_dequeue & EP_CTX_TR_DEQUEUE_LO_MASK) | EP_CTX_DCS);
+    XHCI_WRITE32(&ep0c->tr_dequeue_hi, (uint32_t)(tr_dequeue >> 32));
 
     for (int i = 0; i < 5; i++) {
         status = xhci_send_command(xhci, TRB_CMD_ADDRESS_DEVICE, icc_phys,
@@ -150,11 +211,13 @@ static mx_status_t xhci_address_device(xhci_t* xhci, uint32_t slot_id, uint32_t 
             break;
         }
     }
-    mtx_unlock(&xhci->input_context_lock);
 
-    if (status == MX_OK) {
-        ep->enabled = true;
+    if (status != MX_OK) {
+        printf("TRB_CMD_ADDRESS_DEVICE failed: %d\n", status);
+        ep->enabled = false;
     }
+
+    mtx_unlock(&xhci->input_context_lock);
     return status;
 }
 
@@ -231,64 +294,6 @@ static mx_status_t xhci_handle_enumerate_device(xhci_t* xhci, uint32_t hub_addre
 
     result = xhci_address_device(xhci, slot_id, hub_address, port, speed);
     if (result != MX_OK) {
-        goto disable_slot_exit;
-    }
-
-    // read first 8 bytes of device descriptor to fetch ep0 max packet size
-    usb_device_descriptor_t device_descriptor;
-    for (int i = 0; i < 5; i++) {
-        result = xhci_get_descriptor(xhci, slot_id, USB_TYPE_STANDARD, USB_DT_DEVICE << 8, 0,
-                                     &device_descriptor, 8);
-        if (result == MX_ERR_IO_REFUSED) {
-            xhci_reset_endpoint(xhci, slot_id, 0);
-        } else {
-            break;
-        }
-    }
-    if (result != 8) {
-        printf("xhci_get_descriptor failed: %d\n", result);
-        goto disable_slot_exit;
-    }
-
-    int mps = device_descriptor.bMaxPacketSize0;
-    // enforce correct max packet size for ep0
-    switch (speed) {
-        case USB_SPEED_LOW:
-            mps = 8;
-            break;
-        case USB_SPEED_FULL:
-            if (mps != 8 && mps != 16 && mps != 32 && mps != 64) {
-                mps = 8;
-            }
-            break;
-        case USB_SPEED_HIGH:
-            mps = 64;
-            break;
-        case USB_SPEED_SUPER:
-            // bMaxPacketSize0 is an exponent for superspeed devices
-            mps = 1 << mps;
-            break;
-        default:
-            break;
-    }
-
-    // update the max packet size in our device context
-    mtx_lock(&xhci->input_context_lock);
-    xhci_input_control_context_t* icc = (xhci_input_control_context_t*)xhci->input_context;
-    mx_paddr_t icc_phys = xhci->input_context_phys;
-    xhci_endpoint_context_t* ep0c = (xhci_endpoint_context_t*)
-                                            &xhci->input_context[2 * xhci->context_size];
-    memset((void*)icc, 0, xhci->context_size);
-    memset((void*)ep0c, 0, xhci->context_size);
-
-    XHCI_WRITE32(&icc->add_context_flags, XHCI_ICC_EP_FLAG(0));
-    XHCI_SET_BITS32(&ep0c->epc1, EP_CTX_MAX_PACKET_SIZE_START, EP_CTX_MAX_PACKET_SIZE_BITS, mps);
-
-    result = xhci_send_command(xhci, TRB_CMD_EVAL_CONTEXT, icc_phys,
-                               (slot_id << TRB_SLOT_ID_START));
-    mtx_unlock(&xhci->input_context_lock);
-    if (result != MX_OK) {
-        printf("TRB_CMD_EVAL_CONTEXT failed\n");
         goto disable_slot_exit;
     }
 
@@ -554,7 +559,7 @@ mx_status_t xhci_enable_endpoint(xhci_t* xhci, uint32_t slot_id, usb_endpoint_de
             return status;
         }
 
-        mx_paddr_t tr_dequeue = xhci_transfer_ring_start_phys(&slot->eps[index].transfer_ring);
+        mx_paddr_t tr_dequeue = xhci_transfer_ring_current_phys(&slot->eps[index].transfer_ring);
 
         XHCI_SET_BITS32(&epc->epc0, EP_CTX_INTERVAL_START, EP_CTX_INTERVAL_BITS,
                         compute_interval(ep_desc, speed));

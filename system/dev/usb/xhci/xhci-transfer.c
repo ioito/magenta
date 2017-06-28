@@ -12,7 +12,7 @@
 #include "xhci-transfer.h"
 #include "xhci-util.h"
 
-//#define TRACE 1
+#define TRACE 1
 #include "xhci-debug.h"
 
 //#define TRACE_TRBS 1
@@ -456,6 +456,76 @@ mx_status_t xhci_queue_transfer(xhci_t* xhci, iotxn_t* txn) {
     return MX_OK;
 }
 
+mx_status_t xhci_cancel_transfer(xhci_t* xhci, iotxn_t* txn) {
+    usb_protocol_data_t* proto_data = iotxn_pdata(txn, usb_protocol_data_t);
+    uint32_t slot_id = proto_data->device_id;
+    uint8_t ep_index = xhci_endpoint_index(proto_data->ep_address);
+    mx_status_t status = MX_OK;
+    iotxn_t* test;
+    iotxn_t* temp;
+
+    xprintf("xhci_cancel_transfer slot_id: %d ep_index: %d txn: %p\n", slot_id, ep_index, txn);
+
+    xhci_slot_t* slot = &xhci->slots[slot_id];
+    xhci_endpoint_t* ep =  &slot->eps[ep_index];
+    list_node_t completed_txns = LIST_INITIAL_VALUE(completed_txns);
+
+    mtx_lock(&ep->lock);
+
+    // easy case first. if the txn is still in the queued_txn list, we can simply remove it.
+    list_for_every_entry_safe(&ep->queued_txns, test, temp, iotxn_t, node) {
+        if (test == txn) {
+            list_delete(&txn->node);
+            txn->status = MX_ERR_CANCELED;
+            txn->actual = 0;
+            list_add_head(&completed_txns, &txn->node);
+            goto done;
+        }
+    }
+
+    // harder case - remove a transaction that is already in the transfer ring
+    list_for_every_entry_safe(&ep->pending_txns, test, temp, iotxn_t, node) {
+        if (test == txn) {
+            status = xhci_send_command(xhci, TRB_CMD_STOP_ENDPOINT, 0,
+                        (slot_id << TRB_SLOT_ID_START) | ((ep_index + 1) << TRB_ENDPOINT_ID_START));
+printf("TRB_CMD_STOP_ENDPOINT returned %d\n", status);
+
+            if (status != MX_OK) {
+                goto done;
+            }
+
+// BLAA BLAA
+            list_delete(&txn->node);
+            if (ep->current_txn == txn) {
+                ep->current_txn = NULL;
+            }
+            txn->status = MX_ERR_CANCELED;
+            txn->actual = 0;
+            list_add_head(&completed_txns, &txn->node);
+
+// BLAA BLAA
+            
+
+
+            // resume processing transactions
+            xhci_process_transactions_locked(xhci, ep, &completed_txns);
+            goto done;
+        }
+    }
+
+    status = MX_ERR_NOT_FOUND;
+
+done:
+    mtx_unlock(&ep->lock);
+
+    // call complete callbacks out of the lock
+    while ((txn = list_remove_head_type(&completed_txns, iotxn_t, node)) != NULL) {
+        iotxn_complete(txn, txn->status, txn->actual);
+    }
+
+    return status;
+}
+
 static void xhci_control_complete(iotxn_t* txn, void* cookie) {
     completion_signal((completion_t*)cookie);
 }
@@ -497,9 +567,17 @@ int xhci_control_request(xhci_t* xhci, uint32_t slot_id, uint8_t request_type, u
     txn->complete_cb = xhci_control_complete;
     txn->cookie = &completion;
     iotxn_queue(xhci->mxdev, txn);
-    completion_wait(&completion, MX_TIME_INFINITE);
-
-    status = txn->status;
+    status = completion_wait(&completion, MX_SEC(1));
+    if (status == MX_OK) {
+        status = txn->status;
+    } else if (status == MX_ERR_TIMED_OUT) {
+        completion_reset(&completion);
+        status = xhci_cancel_transfer(xhci, txn);
+        if (status == MX_OK) {
+            completion_wait(&completion, MX_TIME_INFINITE);
+            status = MX_ERR_TIMED_OUT;
+        }
+    }
     if (status == MX_OK) {
         status = txn->actual;
 
